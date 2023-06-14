@@ -9,7 +9,7 @@ from rlberry.envs.gym_make import gym_make
 import pathlib
 from rlberry.agents.stable_baselines.stable_baselines import StableBaselinesAgent
 
-from optuna.samplers import TPESampler
+#from optuna.samplers import TPESampler
 
 SEED = 42
 

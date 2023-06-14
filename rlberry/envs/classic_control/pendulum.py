@@ -37,6 +37,7 @@ class Pendulum(RenderInterface2D, Model):
         self.gravity = 10.0
         self.mass = 1.0
         self.length = 1.0
+        self.frame = 0
 
         # rendering info
         self.set_clipping_area((-2.2, 2.2, -2.2, 2.2))
@@ -54,6 +55,7 @@ class Pendulum(RenderInterface2D, Model):
         self.reset()
 
     def reset(self):
+        self.frame = 0
         high = np.array([np.pi, 1])
         low = -high
         self.state = self.rng.uniform(low=low, high=high)
@@ -65,7 +67,7 @@ class Pendulum(RenderInterface2D, Model):
             action,
             type(action),
         )
-
+        done = False
         # save state for rendering
         if self.is_render_enabled():
             self.append_state_for_rendering(np.array(self.state))
@@ -95,7 +97,10 @@ class Pendulum(RenderInterface2D, Model):
         newthetadot = np.clip(newthetadot, -self.max_speed, self.max_speed)
 
         self.state = np.array([newtheta, newthetadot])
-        return self._get_ob(), -costs, False, {}
+        self.frame += 1
+        if self.frame == 200:
+            done = True
+        return self._get_ob(), -costs, done, {}
 
     def _get_ob(self):
         theta, thetadot = self.state
