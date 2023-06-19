@@ -1,8 +1,10 @@
-from utils import ReplayBuffer, get_qref, get_vref, alpha_sync
+from rlberry.agents.experimental.torch.sac.utils import ReplayBuffer, get_qref, get_vref, alpha_sync
+import time
 
 import torch
 import torch.nn as nn
 from torch.nn.functional import one_hot
+import numpy as np
 
 import gym.spaces as spaces
 
@@ -14,6 +16,8 @@ from rlberry.agents.torch.utils.models import default_value_net_fn
 from rlberry.agents.torch.utils.models import default_twinq_net_fn
 from rlberry.utils.torch import choose_device
 from rlberry.wrappers.uncertainty_estimator_wrapper import UncertaintyEstimatorWrapper
+
+from stable_baselines3.common.buffers import ReplayBuffer
 
 import rlberry
 import torch.optim as optim
@@ -75,8 +79,6 @@ class SACAgent(AgentWithSimplePolicy):
         Learning rate.
     optimizer_type: str
         Type of optimizer. 'ADAM' by defaut.
-    k_epochs : int
-        Number of epochs per update.
     policy_net_fn : function(env, **kwargs)
         Function that returns an instance of a policy network (pytorch).
         If None, a default net is used.
@@ -107,16 +109,22 @@ class SACAgent(AgentWithSimplePolicy):
     """
 
     name = "SAC"
+
     def __init__(
         self,
         env,
-        batch_size=8,
+        batch_size=256,
         gamma=0.99,
-        entr_coef=0.01,
-        learning_rate=0.01,
-        buffer_capacity: int = 30000,
+        q_learning_rate=1e-3,
+        policy_learning_rate=3e-4,
+        buffer_capacity: int = int(1e6),
         optimizer_type="ADAM",
-        k_epochs=5,
+        tau=0.005,
+        policy_frequency=2,
+        alpha=0.2,
+        autotune_alpha=False,
+        learning_start=5e3,
+        writer_frequency=10,
         policy_net_fn=None,
         policy_net_kwargs=None,
         q_net_constructor=None,
@@ -128,24 +136,25 @@ class SACAgent(AgentWithSimplePolicy):
     ):
         AgentWithSimplePolicy.__init__(self, env, **kwargs)
 
+        # check environment
+        assert isinstance(self.env.observation_space, spaces.Box)
+        assert isinstance(self.env.action_space, spaces.Box)
+
         self.batch_size = batch_size
         self.gamma = gamma
-        self.entr_coef = entr_coef
-        self.learning_rate = learning_rate
+        self.q_learning_rate = q_learning_rate
+        self.policy_learning_rate = policy_learning_rate
         self.buffer_capacity = buffer_capacity
-        self.k_epochs = k_epochs
+        self.learning_start = learning_start
+        self.policy_frequency = policy_frequency
+        self.tau = tau
+        self.writer_frequency = writer_frequency
         self.device = choose_device(device)
+
         self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -5
-        self.q_lr = 1e-3
         
-        model_config = {
-        "layer_sizes": (256, 256)
-        }
-
-        self.policy_net_kwargs = policy_net_kwargs or model_config
-        #self.state_dim = self.env.observation_space.shape[0]
-        #self.action_dim = self.env.action_space.n
+        self.policy_net_kwargs = policy_net_kwargs or {}
 
         if isinstance(q_net_constructor, str):
             q_net_ctor = load(q_net_constructor)
@@ -165,42 +174,36 @@ class SACAgent(AgentWithSimplePolicy):
 
 
         self.policy_net_fn = policy_net_fn or default_policy_net_fn
-        self.policy_frequency = 2
 
-        self.optimizer_kwargs = {"optimizer_type": optimizer_type, "lr": learning_rate}
-
-        self.action_scale = torch.tensor((self.env.action_space.high - self.env.action_space.low) / 2.0, dtype=torch.float32)
-        self.action_bias = torch.tensor((self.env.action_space.high + self.env.action_space.low) / 2.0, dtype=torch.float32)
+        self.q_optimizer_kwargs = {"optimizer_type": optimizer_type, "lr": q_learning_rate}
+        self.policy_optimizer_kwargs = {"optimizer_type": optimizer_type, "lr": policy_learning_rate}
+        
+        self.action_scale = torch.tensor((self.env.action_space.high - self.env.action_space.low) / 2.0, dtype=torch.float32).to(self.device)
+        self.action_bias = torch.tensor((self.env.action_space.high + self.env.action_space.low) / 2.0, dtype=torch.float32).to(self.device)        
         
 
-        self.writer_frequency = 10
-        self.autotune = True
-        ## TODO : Add Alpha to constructor and docstring
-        ## TODO : ADD qlr to constructor and docstring 
-        #self.alpha = 0.2
-        
-        # check environment
-        assert isinstance(self.env.observation_space, spaces.Box)
-        assert isinstance(self.env.action_space, spaces.Box)
+        self.autotune = autotune_alpha
+        if not self.autotune:
+            self.alpha = alpha
 
         # initialize
         self.reset()
 
         # initialize replay buffer
-        self.replay_buffer = ReplayBuffer(buffer_capacity, self.rng)
-
-
-
-
-
+        self.replay_buffer = ReplayBuffer(
+        self.batch_size,
+        self.env.observation_space,
+        self.env.action_space,
+        handle_timeout_termination=True,
+    )
+        
 
     def reset(self, **kwargs):
         # actor
         self.cont_policy = self.policy_net_fn(self.env, **self.policy_net_kwargs).to(self.device)
-        self.policy_optimizer = optimizer_factory(self.cont_policy.parameters(), **self.optimizer_kwargs)
+        self.policy_optimizer = optimizer_factory(self.cont_policy.parameters(), **self.policy_optimizer_kwargs)
         self.cont_policy.load_state_dict(self.cont_policy.state_dict())
 
-        # twinq networks
         ## TODO : Load state dict for Q1/Q2 and targets ?
         self.q1 = self.q_net_ctor(self.env, **self.q_net_kwargs)
         self.q2 = self.q_net_ctor(self.env, **self.q_net_kwargs)
@@ -211,60 +214,50 @@ class SACAgent(AgentWithSimplePolicy):
         self.q1_target.to(self.device)
         self.q2_target.to(self.device)
         self.q1_optimizer = optimizer_factory(
-            self.q1.parameters(), **self.optimizer_kwargs
+            self.q1.parameters(), **self.q_optimizer_kwargs
         )
         self.q2_optimizer = optimizer_factory(
-            self.q2.parameters(), **self.optimizer_kwargs
+            self.q2.parameters(), **self.q_optimizer_kwargs
         )
         self.q1_target_optimizer = optimizer_factory(
-            self.q1.parameters(), **self.optimizer_kwargs
+            self.q1.parameters(), **self.q_optimizer_kwargs
         )
         self.q2_target_optimizer = optimizer_factory(
-            self.q2.parameters(), **self.optimizer_kwargs
+            self.q2.parameters(), **self.q_optimizer_kwargs
         )
-            # Automatic entropy tuning
+
+        self.MseLoss = nn.MSELoss()
+        
+        # Automatic entropy tuning
         if self.autotune:
             self.target_entropy = -torch.prod(torch.Tensor(self.env.action_space.shape).to(self.device)).item()
             self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
             self.alpha = self.log_alpha.exp().item()
-            self.a_optimizer = optim.Adam([self.log_alpha], lr=self.q_lr)
-        else:
-            self.alpha = 0.2
-        # loss function
-        self.MseLoss = nn.MSELoss()
-
-        # initialize episode counter
+            self.a_optimizer = optim.Adam([self.log_alpha], lr=self.q_learning_rate)
+        
+        # initialize episode, steps and time counters
         self.episode = 0
+        self.steps = 0
+        self.time = time.time()
 
-
-    def policy(self, observation):
-        state = observation
-        assert self.cont_policy is not None
-        state = torch.from_numpy(state).float().to(self.device)
+    def policy(self, state):
+        state = torch.FloatTensor(state).to(self.device)
         action_dist = self.cont_policy(state)
-        #mean, log_std = policy_dist.mean, policy_dist.stddev
-        #log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (action_dist.stddev + 1)  # From SpinUp / Denis Yarats
-        #action_dist = torch.distributions.Normal(action_dist.mean, log_std)
+        # Std squash
+        mean, std = action_dist.mean, action_dist.stddev
+        log_std = torch.tanh(torch.log(std))
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
+        action_dist = torch.distributions.Normal(mean, std)
+        
         x_t = action_dist.rsample()
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = action_dist.log_prob(x_t)
         # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.unsqueeze(0)
         log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(action_dist.mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean
-        # state = observation
-        # assert self.cat_policy is not None
-        # state = torch.from_numpy(state).float().to(self.device)
-        # action_dist = self.cat_policy_old(state)
-        # action = action_dist.sample().item()
-        # return action
-
-
-
-
+        return action, log_prob
 
     def fit(self, budget: int, **kwargs):
         """
@@ -277,12 +270,12 @@ class SACAgent(AgentWithSimplePolicy):
             enconters a terminal state in which case it stops early.
         """
         del kwargs
-        n_episodes_to_run = budget
+        n_steps_to_run = budget
         count = 0
-        while count < n_episodes_to_run:
-            #print("Fit episode = ",count)
+        while count < n_steps_to_run:
             self._run_episode()
             count += 1
+        print(f"Timesteps done : {self.steps}")
 
     def _get_batch(self, device="cpu"):
         (
@@ -316,73 +309,80 @@ class SACAgent(AgentWithSimplePolicy):
         )
 
     def _select_action(self, state):
-        state = torch.from_numpy(state).float().to(self.device)
+        state = torch.FloatTensor(state).to(self.device)
         action_dist = self.cont_policy(state)
-        #log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (action_dist.stddev + 1)  # From SpinUp / Denis Yarats
-        #action_dist = torch.distributions.Normal(action_dist.mean, log_std)
+        # Std squash
+        mean, std = action_dist.mean, action_dist.stddev
+        log_std = torch.tanh(torch.log(std))
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
+        action_dist = torch.distributions.Normal(mean, std)
+        
         x_t = action_dist.rsample()
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = action_dist.log_prob(x_t)
         # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.unsqueeze(0)
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
-        # state = torch.from_numpy(state).float().to(self.device)
-        # action_dist = self.cat_policy_old(state)
-        # action = action_dist.sample()
-        # action_logprob = action_dist.log_prob(action)
-        # return action.item(), action_logprob.item()
 
 
     def _run_episode(self):
         """
-        WIP
-        Todos : 
-        [ ] Add learning starts : random exploration without policy for n steps
         """
         # interact for H steps
         episode_rewards = 0
         state = self.env.reset()
         done = False
-        i = 0
         while not done:
-            i += 1
-            #print(i)
-            action, action_logprob = self._select_action(state)
-            action = action.detach().cpu().numpy()
-            action_logprob = action_logprob.detach().cpu().numpy()
+            self.steps += 1
+            if self.steps < self.learning_start:
+                action = np.array(self.env.action_space.sample())
+                
+                action_logprob = np.array([[-1]])
+            else:                
+                tensor_state = np.array([state])
+                action, action_logprob = self._select_action(tensor_state)
+                action = action.detach().cpu().numpy()[0]
+                action_logprob = action_logprob.detach().cpu().numpy()
+            
             next_state, reward, done, info = self.env.step(action)
+            
             episode_rewards += reward
-            # save in batch
-            self.replay_buffer.push(
-                (state, next_state, action, action_logprob, reward, done)
-            )
+
+
+            # self.replay_buffer.push(
+            #     (state, next_state, action, action_logprob, reward, done)
+            # )
+            self.replay_buffer.add(state, next_state, action, reward, done, [info])
+
+
             # update state
             state = next_state
-        # update; TODO this condition "self.episode % self.batch_size == 0:" seems to be  completely random to me
-        # implement self.episode -> self.steps
+            if self.steps > self.learning_start:
+                self._update()
+
         self.episode += 1
-        ## TODO : If Learning starts : 
-        if self.episode % self.batch_size == 0:
-            #print("Starting update ! ")
-            self._update()
+
         # add rewards to writer
-
-
         if self.writer is not None and self.episode % self.writer_frequency == 0:
             self.writer.add_scalar("episode_rewards", episode_rewards, self.episode)
 
         return episode_rewards
 
 
+
     def _update(self):
         # sample batch
-        batch = self._get_batch(self.device)
-
-        #batch = self.replay_buffer.sample(self.batch_size)
-        states, next_state, actions, _, rewards, dones = batch
+        # batch = self._get_batch(self.device)
+        # states, next_state, actions, _, rewards, dones = batch
+        data = self.replay_buffer.sample(self.batch_size)
+        states = data.observations.to(self.device)
+        next_state = data.next_observations.to(self.device)
+        actions = data.actions.to(self.device)
+        rewards = data.rewards.to(self.device)
+        dones = data.dones.to(self.device)
         
         with torch.no_grad():
                 next_state_actions, next_state_log_pi = self._select_action(next_state.detach().cpu().numpy())
@@ -391,12 +391,8 @@ class SACAgent(AgentWithSimplePolicy):
                 min_q_next_target = torch.min(q1_next_target, q2_next_target) - self.alpha * next_state_log_pi
                 next_q_value = rewards.flatten() + (1 - dones.flatten()) * self.gamma * (min_q_next_target).view(-1)
 
-        ## TODO : Compare with .view(-1 from clr)
         q1_v = self.q1(torch.cat([states, actions], dim=1))
         q2_v = self.q2(torch.cat([states, actions], dim=1))
-        q1_loss_v = self.MseLoss(q1_v.squeeze(), next_q_value)
-        ## TODO : Maybe try : 
-        ## q1_loss_v = self.MseLoss(q1_v.squeeze(), next_q_value.detach())
         q1_loss_v = self.MseLoss(q1_v.squeeze(), next_q_value)
         q2_loss_v = self.MseLoss(q2_v.squeeze(), next_q_value)
         q_loss_v = q1_loss_v + q2_loss_v
@@ -409,18 +405,13 @@ class SACAgent(AgentWithSimplePolicy):
         
 
         # Actor
-        if self.episode % self.policy_frequency == 0 : #TD3 Delayed update
+        if self.steps % self.policy_frequency == 0 :    #TD3 Delayed update
             for _ in range(self.policy_frequency):
                 state_action, state_log_pi = self._select_action(states.detach().cpu().numpy())
-                #acts_v = action_dist.sample()
-                #acts_v_one_hot = one_hot(acts_v, self.env.action_space.n)
                 q_out_v1 = self.q1(torch.cat([states, state_action], dim=1))
                 q_out_v2 = self.q2(torch.cat([states, state_action], dim=1))
                 q_out_v = torch.min(q_out_v1, q_out_v2)
                 act_loss = ((self.alpha * state_log_pi) - q_out_v).mean()
-                # act_loss = (
-                #     -q_out_v.mean() + self.entr_coef * action_dist.log_prob(acts_v).mean()
-                # )
                 self.policy_optimizer.zero_grad()
                 act_loss.backward()
                 self.policy_optimizer.step()
@@ -435,10 +426,20 @@ class SACAgent(AgentWithSimplePolicy):
                     self.a_optimizer.step()
                     self.alpha = self.log_alpha.exp().item()
 
-        if self.writer is not None and self.episode % self.writer_frequency == 0:
-            self.writer.add_scalar(
+            if self.writer is not None and self.episode % self.writer_frequency == 0:
+                self.writer.add_scalar(
                 "loss_act", float(act_loss.detach()), self.episode
             )
+                self.writer.add_scalar(
+                "alpha", float(self.alpha), self.episode
+            )
+                self.writer.add_scalar("SPS", int(self.steps / (time.time() - self.time)), self.episode)
+                if self.autotune:
+                    self.writer.add_scalar(
+                    "alpha_loss", float(alpha_loss.detach()), self.episode
+                )      
+        
+        if self.writer is not None and self.episode % self.writer_frequency == 0:
             self.writer.add_scalar(
                 "loss_q1", float(q1_loss_v.detach()), self.episode
             )
@@ -452,15 +453,11 @@ class SACAgent(AgentWithSimplePolicy):
                 "value_q2", float(q2_v.mean().detach()), self.episode
             )
             self.writer.add_scalar(
-                "alpha", float(self.alpha), self.episode
-            )
-            if self.autotune:
-                self.writer.add_scalar(
-                "alpha_loss", float(alpha_loss.detach()), self.episode
-            )                
+                "steps", self.steps, self.episode
+            )    
 
-        alpha_sync(self.q1, self.q1_target, 1 - 0.005)
-        alpha_sync(self.q2, self.q2_target, 1 - 0.005)
+        alpha_sync(self.q1, self.q1_target, 1 - self.tau)
+        alpha_sync(self.q2, self.q2_target, 1 - self.tau)
 
 
     #
@@ -471,13 +468,11 @@ class SACAgent(AgentWithSimplePolicy):
         batch_size = trial.suggest_categorical("batch_size", [1, 4, 8, 16, 32])
         gamma = trial.suggest_categorical("gamma", [0.9, 0.95, 0.99])
         learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1)
-        entr_coef = trial.suggest_loguniform("entr_coef", 1e-8, 0.1)
-        k_epochs = trial.suggest_categorical("k_epochs", [1, 5, 10, 20])
+        #entr_coef = trial.suggest_loguniform("entr_coef", 1e-8, 0.1)
+        #k_epochs = trial.suggest_categorical("k_epochs", [1, 5, 10, 20])
 
         return {
             "batch_size": batch_size,
             "gamma": gamma,
             "learning_rate": learning_rate,
-            "entr_coef": entr_coef,
-            "k_epochs": k_epochs,
         }
